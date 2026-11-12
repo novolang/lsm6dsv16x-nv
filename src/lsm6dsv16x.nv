@@ -94,11 +94,11 @@
 // `i2c_write`, `spi_read_into` and `spi_write`, so a test runs them over a
 // double of the bus.
 
-use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, BoardTimer, I2cBus, SpiBus, GpioOut }
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_accel.{ AccelMilliG, AccelRange, AccelFifoMode, AccelMode, Accelerometer }
 use dev_gyro.{ GyroMilliDps, GyroRange, Gyroscope }
-use dev_imu.{ ImuSample, Imu }
+use dev_imu.{ ImuSample, ImuSampleT, ImuQuat, Imu }
 use dev_thermo.{ TempMilliC, Thermometer }
 use dev_id.{ DeviceId, Identifiable }
 
@@ -120,6 +120,7 @@ let CTRL6             = 0x15
 let CTRL8             = 0x17
 let CTRL10            = 0x19
 let FIFO_STATUS1      = 0x1B
+let FIFO_STATUS2      = 0x1C
 let STATUS_REG        = 0x1E
 let OUT_TEMP_L        = 0x20
 let OUTX_L_G          = 0x22
@@ -164,11 +165,14 @@ let ST_XLDA = 0x01
 let ST_GDA  = 0x02
 // FIFO_CTRL4: bypass and continuous mode.
 let FIFO_BYPASS     = 0x00
+let FIFO_STOP_FULL  = 0x01
 let FIFO_CONTINUOUS = 0x06
 // FIFO tags: the gyroscope, the accelerometer and the game rotation vector.
 let TAG_GYRO      = 1
 let TAG_ACCEL     = 2
 let TAG_SFLP_GAME = 0x13
+// FIFO_STATUS2: the watermark flag.
+let FS2_WTM_IA = 0x80
 // The most the watermark takes, in words.
 let FIFO_WTM_MAX = 255
 // The most samples the driver moves out of the FIFO into one list.
@@ -420,25 +424,29 @@ pub fn accel_fs_of(r: AccelRange) -> Int
         AccelRange8g  => 2
         AccelRange16g => 3
 
-// The gyroscope range a CTRL6 byte selects (§ 9.19): 0001 ±250, 0010 ±500,
-// 0011 ±1000, 0100 ±2000 dps.  0000 is ±125 dps and 1100 is ±4000 dps, which
-// `GyroRange` has no values for; the narrowest and the widest value are
-// answered, and a reserved code reads as ±250 dps.
+// The gyroscope range a CTRL6 byte selects (§ 9.19): 0000 ±125, 0001 ±250,
+// 0010 ±500, 0011 ±1000, 0100 ±2000 and 1100 ±4000 dps.  A reserved code
+// reads as ±250 dps.
 pub fn gyro_range_of(ctrl6: Int) -> GyroRange
     match ctrl6 & 15
+        0  => GyroRange125dps
         2  => GyroRange500dps
         3  => GyroRange1000dps
         4  => GyroRange2000dps
-        12 => GyroRange2000dps
+        12 => GyroRange4000dps
         _  => GyroRange250dps
 
-// The FS_G code for a range.
+// The FS_G code for a range, -1 for a range the part does not have: the
+// three below ±125 dps (±15.625, ±31.25 and ±62.5).
 pub fn gyro_fs_of(r: GyroRange) -> Int
     match r
+        GyroRange125dps  => 0
         GyroRange250dps  => 1
         GyroRange500dps  => 2
         GyroRange1000dps => 3
         GyroRange2000dps => 4
+        GyroRange4000dps => 12
+        _                => -1
 
 // The accelerometer step in micro-g per count (Table 3).
 pub fn ug_per_count(ctrl8: Int) -> Int
@@ -687,6 +695,28 @@ pub fn accel_mode_read<P: Lsm6dsv16xPort>(p: P) -> Lsm6dsv16xMode [hw]
 pub fn accel_mode_write<P: Lsm6dsv16xPort>(p: P, m: Lsm6dsv16xMode) -> Bool [hw]
     mode_set(p, CTRL1, true, accel_mode_code(m))
 
+// The accelerometer's mode as `Accelerometer.accel_mode` states it: normal
+// mode is `AccelNormal`, the low-power modes `AccelLowPower`, and high
+// performance and high-accuracy ODR, which resolve the most, are
+// `AccelHighResolution`.  `None` when the part did not answer.
+pub fn accel_mode_of<P: Lsm6dsv16xPort>(p: P) -> ?AccelMode [hw]
+    let Some(c) = reg_read(p, CTRL1) else return None
+    match (c >> 4) & 7
+        4 => Some(AccelLowPower)
+        5 => Some(AccelLowPower)
+        6 => Some(AccelLowPower)
+        7 => Some(AccelNormal)
+        _ => Some(AccelHighResolution)
+
+// Puts the accelerometer in the mode nearest `m`: the first low-power mode
+// for `AccelLowPower`, normal mode for `AccelNormal` and high performance
+// for `AccelHighResolution`.  Whether the part took it.
+pub fn accel_mode_set<P: Lsm6dsv16xPort>(p: P, m: AccelMode) -> Bool [hw]
+    match m
+        AccelLowPower       => accel_mode_write(p, Lsm6dsv16xLowPower)
+        AccelNormal         => accel_mode_write(p, Lsm6dsv16xNormal)
+        AccelHighResolution => accel_mode_write(p, Lsm6dsv16xHighPerf)
+
 // Selects the accelerometer's low-power mode by the number of samples it
 // averages, 2, 4 or 8 (OP_MODE_XL 100, 101 and 110): whether the part took
 // it.  Any other number is refused.
@@ -760,6 +790,25 @@ pub fn imu_read_of<P: Lsm6dsv16xPort>(p: P) -> ?ImuSample [hw]
     Some(ImuSample { accel: accel_at(b, 6, ug_per_count(r[2] as Int)),
         gyro: gyro_at(b, 0, udps_per_count(r[0] as Int)) })
 
+// The temperature at `i` of `b` in milli-degrees Celsius: the 16-bit count
+// at 256 per degree, 0 at 25 °C (Table 6).
+fn temp_at(b: DevBytes, i: Int) -> TempMilliC
+    TempMilliC { milli_c: TEMP_ZERO_MC + s16_at(b, i) * 1000 / TEMP_COUNTS_PER_C }
+
+// The same burst with the die temperature: OUT_TEMP_L and OUT_TEMP_H come
+// right before the gyroscope's registers, so one burst of fourteen registers
+// holds the temperature, the gyroscope and the accelerometer of one instant.
+pub fn imu_read_temp_of<P: Lsm6dsv16xPort>(p: P) -> ?ImuSampleT [hw]
+    var r: DevBytes = Vec.new()
+    if not p.read_regs(CTRL6, 3, var r)
+        return None
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(OUT_TEMP_L, 14, var b)
+        return None
+    Some(ImuSampleT { accel: accel_at(b, 8, ug_per_count(r[2] as Int)),
+        gyro: gyro_at(b, 2, udps_per_count(r[0] as Int)),
+        temp: temp_at(b, 0) })
+
 // Whether a new accelerometer sample has completed since the last read:
 // STATUS_REG's XLDA.
 pub fn accel_ready_of<P: Lsm6dsv16xPort>(p: P) -> Bool [hw]
@@ -775,7 +824,7 @@ pub fn temp_read_of<P: Lsm6dsv16xPort>(p: P) -> ?TempMilliC [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(OUT_TEMP_L, 2, var b)
         return None
-    Some(TempMilliC { milli_c: TEMP_ZERO_MC + s16_at(b, 0) * 1000 / TEMP_COUNTS_PER_C })
+    Some(temp_at(b, 0))
 
 // ── Full scale ───────────────────────────────────────────────────────
 
@@ -793,15 +842,11 @@ pub fn gyro_range_read<P: Lsm6dsv16xPort>(p: P) -> GyroRange [hw]
     gyro_range_of(reg_read(p, CTRL6) ?? 1)
 
 // Sets the gyroscope range and leaves LPF1_G_BW: whether the part took it.
+// A range the part does not have is refused and nothing is written.  The
+// readings are converted at the step of the range set.
 pub fn gyro_range_write<P: Lsm6dsv16xPort>(p: P, r: GyroRange) -> Bool [hw]
-    reg_update(p, CTRL6, 0x0F, gyro_fs_of(r))
-
-// Sets the gyroscope's FS_G code to ±125 dps (0) or ±4000 dps (12), which
-// `GyroRange` has no values for: whether the part took it.  Any other code
-// is refused; the ranges of the trait are set with `gyro_range_write`.  The
-// readings are converted at the code's step.
-pub fn gyro_fs_code_write<P: Lsm6dsv16xPort>(p: P, code: Int) -> Bool [hw]
-    if code != 0 and code != 12
+    let code = gyro_fs_of(r)
+    if code < 0
         return false
     reg_update(p, CTRL6, 0x0F, code)
 
@@ -857,6 +902,11 @@ pub fn fifo_count<P: Lsm6dsv16xPort>(p: P) -> Int [hw]
 // configuration, and write the mode last, as this does; the compression
 // bits of FIFO_CTRL2 are cleared, and its reserved bits left as they are.
 pub fn fifo_start<P: Lsm6dsv16xPort>(p: P, threshold: Int, with_gyro: Bool) -> Bool [hw]
+    fifo_run(p, threshold, with_gyro, FIFO_CONTINUOUS)
+
+// `fifo_start` with the FIFO_MODE bits given: `FIFO_CONTINUOUS` overwrites
+// the oldest word when the FIFO is full, `FIFO_STOP_FULL` stops collecting.
+fn fifo_run<P: Lsm6dsv16xPort>(p: P, threshold: Int, with_gyro: Bool, mode: Int) -> Bool [hw]
     var th = threshold
     if th < 1
         th = 1
@@ -878,7 +928,32 @@ pub fn fifo_start<P: Lsm6dsv16xPort>(p: P, threshold: Int, with_gyro: Bool) -> B
         return false
     if not reg_update(p, INT1_CTRL, INT1_DRDY_XL | INT1_DRDY_G | INT1_FIFO_TH, INT1_FIFO_TH)
         return false
-    reg_update(p, FIFO_CTRL4, 0x07, FIFO_CONTINUOUS)
+    reg_update(p, FIFO_CTRL4, 0x07, mode)
+
+// What the FIFO does and the watermark in words, 1 to 32, for
+// `Accelerometer.accel_fifo_config`: whether the part took every setting.
+// `AccelFifoOff` bypasses the FIFO and empties it (`fifo_stop`), the
+// watermark ignored.  `AccelFifoStream` is continuous mode and
+// `AccelFifoStop` the part's FIFO mode, which stops collecting when the FIFO
+// is full; both batch the accelerometer, and the gyroscope too when it is
+// running, so the watermark counts the words of both, as `fifo_count` does.
+// A watermark outside 1 to 32 is refused.
+pub fn fifo_configure<P: Lsm6dsv16xPort>(p: P, mode: AccelFifoMode, watermark: Int) -> Bool [hw]
+    if mode == AccelFifoOff
+        return fifo_stop(p)
+    if watermark < 1 or watermark > LIST_DEPTH
+        return false
+    let Some(g) = reg_read(p, CTRL2) else return false
+    var reg = FIFO_CONTINUOUS
+    if mode == AccelFifoStop
+        reg = FIFO_STOP_FULL
+    fifo_run(p, watermark, (g & 15) != 0, reg)
+
+// Whether the FIFO holds at least the watermark: FIFO_STATUS2's FIFO_WTM_IA,
+// which the part keeps as a level and does not clear when it is read.
+// False when the part did not answer.
+pub fn fifo_watermark_reached<P: Lsm6dsv16xPort>(p: P) -> Bool [hw]
+    ((reg_read(p, FIFO_STATUS2) ?? 0) & FS2_WTM_IA) != 0
 
 // Turns the FIFO off, which empties it, stops the batching and puts the
 // data-ready flags back on INT1: whether the part took every setting.
@@ -1076,6 +1151,44 @@ pub fn fifo_read_quat<P: Lsm6dsv16xPort>(p: P, var dst: Vec[Lsm6dsv16xQuat; 32])
             let _ = dst.push(quat_at(b, 1))
     moved
 
+// Turns the game rotation vector on or off for `Imu.imu_fusion_enable`:
+// whether the part took it.  Turning it on enables the block and puts its
+// words in the FIFO, and starts the FIFO in continuous mode when it is in
+// bypass, since the words arrive in the FIFO and nowhere else.  A FIFO that
+// already runs is left as it is.  Turning it off stops the block and takes
+// its words out of the FIFO, and leaves the FIFO's mode.  The block needs
+// both sensors on at its rate or faster, which `start` does.
+pub fn fusion_enable<P: Lsm6dsv16xPort>(p: P, on: Bool) -> Bool [hw]
+    if not sflp_enable(p, on)
+        return false
+    if not sflp_fifo_write(p, on)
+        return false
+    if not on
+        return true
+    let Some(mode) = reg_read(p, FIFO_CTRL4) else return false
+    if (mode & 0x07) != FIFO_BYPASS
+        return true
+    reg_update(p, FIFO_CTRL4, 0x07, FIFO_CONTINUOUS)
+
+// A quaternion component in millionths as Q30, for `ImuQuat`.
+fn q30_of(micro: Int) -> Int
+    micro * dev_imu.IMU_QUAT_ONE / 1000000
+
+// The newest game rotation vector in the FIFO as a Q30 quaternion, for
+// `Imu.imu_orientation`, or `None` when the FIFO holds none: the fusion is
+// off, the FIFO is not running, or the part did not answer.  The part
+// delivers the vector only through the FIFO, so the call empties it: every
+// word is taken out, and the words of the sensors are dropped.  A program
+// that also reads the sensors' words from the FIFO reads the vectors with
+// `fifo_read_quat` instead.
+pub fn orientation_read<P: Lsm6dsv16xPort>(p: P) -> ?ImuQuat [hw]
+    var q: Vec[Lsm6dsv16xQuat; 32] = Vec.new()
+    let _ = fifo_read_quat(p, var q)
+    if q.len() == 0
+        return None
+    let last = q[q.len() - 1]
+    Some(ImuQuat { w: q30_of(last.w), x: q30_of(last.x), y: q30_of(last.y), z: q30_of(last.z) })
+
 // ── Self-test ────────────────────────────────────────────────────────
 
 // Waits for a new-data flag of STATUS_REG by polling it, at most
@@ -1254,12 +1367,11 @@ pub fn start<P: Lsm6dsv16xPort>(p: P) -> Bool [hw]
 // ── The part on an I2C bus ───────────────────────────────────────────
 
 // An LSM6DSV16X on a board's I2C bus at the address `w.addr`, 0x6A or 0x6B,
-// with the board's GPIO for the INT1 line and its timer.
+// with the board's GPIO for the INT1 line.
 pub @value
 struct Lsm6dsv16x
     bus: BoardI2c
     pins: BoardGpio
-    timer: BoardTimer
     w: DeviceWiring
 
 impl Lsm6dsv16xPort for Lsm6dsv16x
@@ -1279,13 +1391,13 @@ impl Lsm6dsv16xPort for Lsm6dsv16x
         false
 
     fn wait_us(self, us: Int) [hw]
-        self.timer.delay_us(us)
+        self.bus.delay_us(us)
 
 impl Lsm6dsv16x
     // The part at `w.addr` on the board's I2C bus, as a board's device
     // table builds it.  Nothing is sent.
     fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Lsm6dsv16x
-        Lsm6dsv16x { bus: bus, pins: pins, timer: BoardTimer { id: 0 }, w: w }
+        Lsm6dsv16x { bus: bus, pins: pins, w: w }
 
     // Brings the part up (`start`).
     fn begin(self) -> Bool [hw]
@@ -1306,16 +1418,11 @@ impl Lsm6dsv16x
     fn set_emb_reg(self, r: Int, mask: Int, v: Int) -> Bool [hw]
         emb_update(self, r, mask, v)
 
-    // The gyroscope's setter for the rate, and the rates in thousandths of
-    // a hertz.
+    // The gyroscope's setter for the rate, and its rates in thousandths of
+    // a hertz; the accelerometer's are `Accelerometer.accel_rate_mhz` and
+    // `accel_set_rate_mhz`.
     fn gyro_set_rate_hz(self, hz: Int) -> Int [hw]
         gyro_rate_hz_write(self, hz)
-
-    fn accel_rate_mhz(self) -> Int [hw]
-        accel_rate_read(self)
-
-    fn set_accel_rate_mhz(self, mhz: Int) -> Int [hw]
-        accel_rate_write(self, mhz)
 
     fn gyro_rate_mhz(self) -> Int [hw]
         gyro_rate_read(self)
@@ -1323,18 +1430,11 @@ impl Lsm6dsv16x
     fn set_gyro_rate_mhz(self, mhz: Int) -> Int [hw]
         gyro_rate_write(self, mhz)
 
-    // The gyroscope at ±125 dps or ±4000 dps (code 0 or 12).
-    fn gyro_set_fs_code(self, code: Int) -> Bool [hw]
-        gyro_fs_code_write(self, code)
-
-    // The operating modes of the two sensors and the high-accuracy rate
-    // set.
-    fn accel_mode(self) -> Lsm6dsv16xMode [hw]
-        accel_mode_read(self)
-
-    fn set_accel_mode(self, m: Lsm6dsv16xMode) -> Bool [hw]
-        accel_mode_write(self, m)
-
+    // The accelerometer's low-power mode by the number of samples averaged,
+    // the gyroscope's operating mode and the high-accuracy rate set; the
+    // accelerometer's mode is `Accelerometer.accel_mode` and
+    // `accel_set_mode`, and `accel_mode_read` and `accel_mode_write` take
+    // the part's own four.
     fn set_accel_lp(self, mean: Int) -> Bool [hw]
         accel_lp_write(self, mean)
 
@@ -1357,10 +1457,8 @@ impl Lsm6dsv16x
     fn configure_pins(self, active_low: Bool, open_drain: Bool) -> Bool [hw]
         int_pins_config(self, active_low, open_drain)
 
-    // The FIFO: on, off, and the gyroscope's words and the accelerometer's.
-    fn fifo_begin(self, threshold: Int, with_gyro: Bool) -> Bool [hw]
-        fifo_start(self, threshold, with_gyro)
-
+    // The FIFO: off, and the gyroscope's words and the accelerometer's.  It
+    // is turned on with `Accelerometer.accel_fifo_config`.
     fn fifo_end(self) -> Bool [hw]
         fifo_stop(self)
 
@@ -1368,11 +1466,9 @@ impl Lsm6dsv16x
                      var gyro: Vec[GyroMilliDps; 32]) -> Int [hw]
         fifo_read_imu(self, var accel, var gyro)
 
-    // The game rotation vector: on and off, its rate, its place in the FIFO,
-    // the restart and the quaternions out of the FIFO.
-    fn set_fusion(self, on: Bool) -> Bool [hw]
-        sflp_enable(self, on)
-
+    // The game rotation vector's rate, its place in the FIFO, the restart and
+    // the quaternions out of the FIFO; it is turned on and off with
+    // `Imu.imu_fusion_enable`.
     fn set_fusion_rate(self, ctrl: Int) -> Bool [hw]
         sflp_rate_write(self, ctrl)
 
@@ -1420,6 +1516,26 @@ impl Accelerometer[hw] for Lsm6dsv16x
     fn accel_fifo_read(self, var dst: Vec[AccelMilliG; 32]) -> Int [hw]
         fifo_read(self, var dst)
 
+    fn accel_fifo_config(self, mode: AccelFifoMode, watermark: Int) -> Bool [hw]
+        fifo_configure(self, mode, watermark)
+
+    fn accel_fifo_watermark_reached(self) -> Bool [hw]
+        fifo_watermark_reached(self)
+
+    // The rates in thousandths of a hertz, with the part's 1.875 and 7.5 Hz;
+    // 0 when the sensor is powered down, -1 when the part did not answer.
+    fn accel_rate_mhz(self) -> Int [hw]
+        accel_rate_read(self)
+
+    fn accel_set_rate_mhz(self, mhz: Int) -> Int [hw]
+        accel_rate_write(self, mhz)
+
+    fn accel_mode(self) -> ?AccelMode [hw]
+        accel_mode_of(self)
+
+    fn accel_set_mode(self, m: AccelMode) -> Bool [hw]
+        accel_mode_set(self, m)
+
 impl Gyroscope[hw] for Lsm6dsv16x
     fn gyro_read(self) -> ?GyroMilliDps [hw]
         gyro_read_of(self)
@@ -1440,6 +1556,17 @@ impl Imu[hw] for Lsm6dsv16x
     fn imu_read(self) -> ?ImuSample [hw]
         imu_read_of(self)
 
+    // The die temperature from the same burst of fourteen registers.
+    fn imu_read_temp(self) -> ?ImuSampleT [hw]
+        imu_read_temp_of(self)
+
+    // The sensor fusion block's game rotation vector, through the FIFO.
+    fn imu_orientation(self) -> ?ImuQuat [hw]
+        orientation_read(self)
+
+    fn imu_fusion_enable(self, on: Bool) -> Bool [hw]
+        fusion_enable(self, on)
+
 impl Thermometer[hw] for Lsm6dsv16x
     // The sensor converts by itself while a motion sensor is on, so
     // nothing is started and no time is needed.
@@ -1458,12 +1585,11 @@ impl Identifiable[hw] for Lsm6dsv16x
 // ── The part on an SPI bus ───────────────────────────────────────────
 
 // An LSM6DSV16X on a board's SPI bus with the chip select `w.cs`, with the
-// board's GPIO for the chip select and the INT1 line, and its timer.
+// board's GPIO for the chip select and the INT1 line.
 pub @value
 struct Lsm6dsv16xSpi
     bus: BoardSpi
     pins: BoardGpio
-    timer: BoardTimer
     w: DeviceWiring
 
 impl Lsm6dsv16xPort for Lsm6dsv16xSpi
@@ -1483,13 +1609,13 @@ impl Lsm6dsv16xPort for Lsm6dsv16xSpi
         true
 
     fn wait_us(self, us: Int) [hw]
-        self.timer.delay_us(us)
+        self.bus.delay_us(us)
 
 impl Lsm6dsv16xSpi
     // The part on the board's SPI bus with the chip select `w.cs`, as a
     // board's device table builds it.  Nothing is sent.
     fn attach(bus: BoardSpi, pins: BoardGpio, w: DeviceWiring) -> Lsm6dsv16xSpi
-        Lsm6dsv16xSpi { bus: bus, pins: pins, timer: BoardTimer { id: 0 }, w: w }
+        Lsm6dsv16xSpi { bus: bus, pins: pins, w: w }
 
     // Brings the part up (`start`).
     fn begin(self) -> Bool [hw]
@@ -1510,16 +1636,11 @@ impl Lsm6dsv16xSpi
     fn set_emb_reg(self, r: Int, mask: Int, v: Int) -> Bool [hw]
         emb_update(self, r, mask, v)
 
-    // The gyroscope's setter for the rate, and the rates in thousandths of
-    // a hertz.
+    // The gyroscope's setter for the rate, and its rates in thousandths of
+    // a hertz; the accelerometer's are `Accelerometer.accel_rate_mhz` and
+    // `accel_set_rate_mhz`.
     fn gyro_set_rate_hz(self, hz: Int) -> Int [hw]
         gyro_rate_hz_write(self, hz)
-
-    fn accel_rate_mhz(self) -> Int [hw]
-        accel_rate_read(self)
-
-    fn set_accel_rate_mhz(self, mhz: Int) -> Int [hw]
-        accel_rate_write(self, mhz)
 
     fn gyro_rate_mhz(self) -> Int [hw]
         gyro_rate_read(self)
@@ -1527,18 +1648,11 @@ impl Lsm6dsv16xSpi
     fn set_gyro_rate_mhz(self, mhz: Int) -> Int [hw]
         gyro_rate_write(self, mhz)
 
-    // The gyroscope at ±125 dps or ±4000 dps (code 0 or 12).
-    fn gyro_set_fs_code(self, code: Int) -> Bool [hw]
-        gyro_fs_code_write(self, code)
-
-    // The operating modes of the two sensors and the high-accuracy rate
-    // set.
-    fn accel_mode(self) -> Lsm6dsv16xMode [hw]
-        accel_mode_read(self)
-
-    fn set_accel_mode(self, m: Lsm6dsv16xMode) -> Bool [hw]
-        accel_mode_write(self, m)
-
+    // The accelerometer's low-power mode by the number of samples averaged,
+    // the gyroscope's operating mode and the high-accuracy rate set; the
+    // accelerometer's mode is `Accelerometer.accel_mode` and
+    // `accel_set_mode`, and `accel_mode_read` and `accel_mode_write` take
+    // the part's own four.
     fn set_accel_lp(self, mean: Int) -> Bool [hw]
         accel_lp_write(self, mean)
 
@@ -1561,10 +1675,8 @@ impl Lsm6dsv16xSpi
     fn configure_pins(self, active_low: Bool, open_drain: Bool) -> Bool [hw]
         int_pins_config(self, active_low, open_drain)
 
-    // The FIFO: on, off, and the gyroscope's words and the accelerometer's.
-    fn fifo_begin(self, threshold: Int, with_gyro: Bool) -> Bool [hw]
-        fifo_start(self, threshold, with_gyro)
-
+    // The FIFO: off, and the gyroscope's words and the accelerometer's.  It
+    // is turned on with `Accelerometer.accel_fifo_config`.
     fn fifo_end(self) -> Bool [hw]
         fifo_stop(self)
 
@@ -1572,11 +1684,9 @@ impl Lsm6dsv16xSpi
                      var gyro: Vec[GyroMilliDps; 32]) -> Int [hw]
         fifo_read_imu(self, var accel, var gyro)
 
-    // The game rotation vector: on and off, its rate, its place in the FIFO,
-    // the restart and the quaternions out of the FIFO.
-    fn set_fusion(self, on: Bool) -> Bool [hw]
-        sflp_enable(self, on)
-
+    // The game rotation vector's rate, its place in the FIFO, the restart and
+    // the quaternions out of the FIFO; it is turned on and off with
+    // `Imu.imu_fusion_enable`.
     fn set_fusion_rate(self, ctrl: Int) -> Bool [hw]
         sflp_rate_write(self, ctrl)
 
@@ -1624,6 +1734,26 @@ impl Accelerometer[hw] for Lsm6dsv16xSpi
     fn accel_fifo_read(self, var dst: Vec[AccelMilliG; 32]) -> Int [hw]
         fifo_read(self, var dst)
 
+    fn accel_fifo_config(self, mode: AccelFifoMode, watermark: Int) -> Bool [hw]
+        fifo_configure(self, mode, watermark)
+
+    fn accel_fifo_watermark_reached(self) -> Bool [hw]
+        fifo_watermark_reached(self)
+
+    // The rates in thousandths of a hertz, with the part's 1.875 and 7.5 Hz;
+    // 0 when the sensor is powered down, -1 when the part did not answer.
+    fn accel_rate_mhz(self) -> Int [hw]
+        accel_rate_read(self)
+
+    fn accel_set_rate_mhz(self, mhz: Int) -> Int [hw]
+        accel_rate_write(self, mhz)
+
+    fn accel_mode(self) -> ?AccelMode [hw]
+        accel_mode_of(self)
+
+    fn accel_set_mode(self, m: AccelMode) -> Bool [hw]
+        accel_mode_set(self, m)
+
 impl Gyroscope[hw] for Lsm6dsv16xSpi
     fn gyro_read(self) -> ?GyroMilliDps [hw]
         gyro_read_of(self)
@@ -1643,6 +1773,17 @@ impl Gyroscope[hw] for Lsm6dsv16xSpi
 impl Imu[hw] for Lsm6dsv16xSpi
     fn imu_read(self) -> ?ImuSample [hw]
         imu_read_of(self)
+
+    // The die temperature from the same burst of fourteen registers.
+    fn imu_read_temp(self) -> ?ImuSampleT [hw]
+        imu_read_temp_of(self)
+
+    // The sensor fusion block's game rotation vector, through the FIFO.
+    fn imu_orientation(self) -> ?ImuQuat [hw]
+        orientation_read(self)
+
+    fn imu_fusion_enable(self, on: Bool) -> Bool [hw]
+        fusion_enable(self, on)
 
 impl Thermometer[hw] for Lsm6dsv16xSpi
     // The sensor converts by itself while a motion sensor is on, so

@@ -91,7 +91,7 @@ nothing else. The driver performs no input or output of its own and
 allocates nothing of its own: every buffer is a fixed-size `Vec` in the
 caller's frame. The bus functions of devices-nv build one short frame per
 transaction inside a `system` block and release it when the call returns.
-The waits go through the board's timer, which is `[hw]` too. The package
+The waits go through the bus's `delay_us`, which is `[hw]` too. The package
 checks at every tier, `embedded` included.
 
 ## What it is
@@ -111,10 +111,10 @@ a count is not the full scale over 2^15 (Table 3).
 |---|---|---|---|---|---|---|
 | Gyroscope step | 4.375 mdps | 8.75 mdps | 17.5 mdps | 35 mdps | 70 mdps | 140 mdps |
 
-`GyroRange` has values for ±250 to ±2000 dps. `gyro_set_fs_code(0)` and
-`gyro_set_fs_code(12)` set ±125 and ±4000 dps; `gyro_range` then answers
-`GyroRange250dps` and `GyroRange2000dps`, and the readings are converted at
-the step of the code. The temperature is `OUT_TEMP / 256 + 25` degrees (Table
+`GyroRange` has all six: `GyroRange125dps` and `GyroRange4000dps` are the
+codes 0 and 12. `GyroRange15dps`, `GyroRange31dps` and `GyroRange62dps` are
+below the part's narrowest range and are refused, nothing written. The
+readings are converted at the step of the range set. The temperature is `OUT_TEMP / 256 + 25` degrees (Table
 6).
 
 Each sensor has its own operating mode and rate. The accelerometer's
@@ -164,23 +164,26 @@ A program on a board uses `Lsm6dsv16x` for a part on I2C and
 `Lsm6dsv16xSpi` for a part on SPI. Each is built by `attach` with the
 board's bus, its GPIO and the wiring, as a board's device table builds it.
 Both implement `Accelerometer`, `Gyroscope`, `Imu`, `Thermometer` and
-`Identifiable`.
+`Identifiable`. The part has a data-ready flag for each sensor, so `ImuControl`
+is not implemented.
 
 | Method | What it does |
 |---|---|
 | `attach(bus, pins, w)` | the part at `w.addr` (I2C) or with the chip select `w.cs` (SPI); nothing is sent |
 | `begin()` | brings the part up, see below |
-| `accel_read()`, `gyro_read()`, `imu_read()` | `Accelerometer`, `Gyroscope`, `Imu`: milli-g, milli-degrees per second, and both from one burst of twelve registers |
+| `accel_read()`, `gyro_read()`, `imu_read()`, `imu_read_temp()` | `Accelerometer`, `Gyroscope`, `Imu`: milli-g, milli-degrees per second, and both from one burst of twelve registers, the second form with the die temperature from one burst of fourteen |
 | `accel_ready()`, `gyro_ready()` | the new-data flags of STATUS_REG |
-| `accel_range()`, `accel_set_range(r)`, `gyro_range()`, `gyro_set_range(r)` | the full scales, changed without touching the other bits of the register; `gyro_set_fs_code(code)` for ±125 and ±4000 dps |
+| `accel_range()`, `accel_set_range(r)`, `gyro_range()`, `gyro_set_range(r)` | the full scales, changed without touching the other bits of the register; the gyroscope's ±125 to ±4000 dps |
 | `accel_rate_hz()`, `accel_set_rate_hz(hz)`, `gyro_rate_hz()`, `gyro_set_rate_hz(hz)` | the rates in whole hertz, and the slowest rate at or above `hz` that the sensor's mode runs; 0 powers the sensor down |
-| `accel_rate_mhz()`, `set_accel_rate_mhz(mhz)`, `gyro_rate_mhz()`, `set_gyro_rate_mhz(mhz)` | the same in thousandths of a hertz, which has 1.875 Hz and the high-accuracy rates exactly |
-| `accel_mode()`, `set_accel_mode(m)`, `set_accel_lp(mean)`, `gyro_mode()`, `set_gyro_mode(m)`, `set_ha_series(sel)` | the operating modes, the number of samples the accelerometer's low-power mode averages (2, 4 or 8), and the rate set of high-accuracy ODR mode |
+| `accel_rate_mhz()`, `accel_set_rate_mhz(mhz)`, `gyro_rate_mhz()`, `set_gyro_rate_mhz(mhz)` | the same in thousandths of a hertz, which has 1.875 Hz and the high-accuracy rates exactly |
+| `accel_mode()`, `accel_set_mode(m)` | `AccelLowPower` for the low-power modes, `AccelNormal` for normal mode, `AccelHighResolution` for high performance and high-accuracy ODR |
+| `set_accel_lp(mean)`, `gyro_mode()`, `set_gyro_mode(m)`, `set_ha_series(sel)` | the number of samples the accelerometer's low-power mode averages (2, 4 or 8), the gyroscope's operating mode, and the rate set of high-accuracy ODR mode; the module's `accel_mode_read` and `accel_mode_write` take the part's own four modes |
 | `temp_read()` | `Thermometer`: the die temperature |
 | `device_id()` | `Identifiable`: WHO_AM_I, 0x70 |
-| `fifo_begin(n, with_gyro)`, `fifo_end()` | turn the FIFO on in continuous mode with the watermark at `n` words, and off |
+| `accel_fifo_config(mode, n)`, `accel_fifo_watermark_reached()`, `fifo_end()` | turn the FIFO on in continuous mode (`AccelFifoStream`) or in the part's stop-on-full FIFO mode (`AccelFifoStop`) with the watermark at `n` words, 1 to 32, whether FIFO_WTM_IA is set, and the FIFO off |
 | `accel_fifo_count()`, `accel_fifo_read(dst)`, `fifo_take_imu(accel, gyro)`, `fifo_take_quat(dst)` | the FIFO: the word count, the accelerometer's words, both sensors', and the game rotation vectors |
-| `set_fusion(on)`, `set_fusion_rate(ctrl)`, `set_fusion_fifo(on)`, `reset_fusion()` | the sensor fusion low-power block: on, its rate, its place in the FIFO, a restart |
+| `imu_fusion_enable(on)`, `imu_orientation()` | `Imu`: the sensor fusion low-power block on (with its words in the FIFO, and the FIFO started when it is in bypass) and off, and the newest game rotation vector as a Q30 quaternion; reading it empties the FIFO |
+| `set_fusion_rate(ctrl)`, `set_fusion_fifo(on)`, `reset_fusion()` | the sensor fusion low-power block: its rate, its place in the FIFO, a restart |
 | `route_int1(mask)`, `route_int2(mask)`, `configure_pins(active_low, open_drain)` | the interrupt pins |
 | `accel_test(negative)`, `gyro_test(negative)` | the change in milli-g and in milli-degrees per second that each self-test makes |
 | `reg(r)`, `set_reg(r, v)`, `emb_reg(r)`, `set_emb_reg(r, mask, v)` | one register, a write that is read back, and a register of the embedded functions bank |
@@ -204,11 +207,15 @@ which take the port: `lsm6dsv16x.imu_read_of(port)`,
 ### The FIFO
 
 The FIFO is an option. It is 1.5 KB of words of a tag byte and six data
-bytes, and `begin` leaves it off. `fifo_begin` puts it in continuous mode,
-which overwrites the oldest word when it is full, batches the accelerometer
-at its present rate and the gyroscope too when asked, and puts the
-watermark on INT1 in place of the data-ready flags. The watermark is 1 to
-255 words. The part counts words of every kind, nine bits of them, so with
+bytes, and `begin` leaves it off. `accel_fifo_config` puts it in continuous
+mode (`AccelFifoStream`), which overwrites the oldest word when it is full,
+or in FIFO mode (`AccelFifoStop`), which stops collecting when it is full.
+It batches the accelerometer at its present rate and the gyroscope too when
+the gyroscope is running, and puts the watermark on INT1 in place of the
+data-ready flags. The watermark is 1 to 32 words through the trait (the
+module's `fifo_start` takes up to 255), and `accel_fifo_watermark_reached`
+reads FIFO_STATUS2's FIFO_WTM_IA, which the part keeps as a level.
+`AccelFifoOff` is `fifo_end`. The part counts words of every kind, nine bits of them, so with
 both sensors batched the count is the accelerometer's and the gyroscope's
 together, and the words alternate. Compression is off.
 
@@ -229,16 +236,22 @@ data bytes are the quaternion's x, y and z as IEEE 754 half-precision
 numbers, low byte first; w is not stored and is the square root of one
 minus the sum of their squares, as ST's `sflp2q` computes it. The driver
 answers an `Lsm6dsv16xQuat` of four integers in millionths, so 1,000,000 is
-1.0.
+1.0, from `fifo_take_quat`, and `imu_orientation` answers the newest as the
+trait's `ImuQuat` in Q30. The part delivers the vector through the FIFO and
+nowhere else, so `imu_orientation` takes every word out of the FIFO, drops
+the sensors' words and answers `None` when the FIFO holds no vector; a
+program that also reads the sensors' words uses `fifo_take_quat`.
+`imu_fusion_enable(true)` enables the block, puts its words in the FIFO and
+starts the FIFO in continuous mode when it is in bypass.
 
 ```novo norun:fragment
 // The block runs at 60 Hz, so the sensors run at 60 Hz or more.
-let _ = imu.set_accel_rate_mhz(60000)
+let _ = imu.accel_set_rate_mhz(60000)
 let _ = imu.set_gyro_rate_mhz(60000)
 let _ = imu.set_fusion_rate(2)       // 15, 30, 60, 120, 240, 480 Hz
 let _ = imu.set_fusion_fifo(true)
-let _ = imu.set_fusion(true)
-let _ = imu.fifo_begin(16, false)    // the watermark is in words
+let _ = imu.imu_fusion_enable(true)
+let _ = imu.accel_fifo_config(AccelFifoMode.AccelFifoStream, 16)   // words
 // Later, when the watermark pin falls or the count is not 0:
 var q: Vec[Lsm6dsv16xQuat; 32] = Vec.new()
 let n = imu.fifo_take_quat(var q)
@@ -273,14 +286,14 @@ work or the restore failed.
    the exact rate.
 7. High-accuracy ODR mode has to be entered and left with the sensor in
    power-down, and when one sensor is in it the other has to be in it too
-   (§ 6.5). `set_accel_mode` and `set_gyro_mode` power the sensor down for
+   (§ 6.5). `accel_set_mode` and `set_gyro_mode` power the sensor down for
    such a change and write the rate back, moved to the nearest rate the new
    mode runs; the other sensor's mode is the program's. HAODR_SEL is chosen
    with `set_ha_series` while the sensors are in power-down.
-8. The FIFO is configured from bypass: `fifo_begin` writes bypass first,
-   then the watermark, the batch rates, the interrupt route, and the mode
-   last. Batching is at the rates the sensors run at, so a change of rate
-   after `fifo_begin` leaves the batch rate where it was.
+8. The FIFO is configured from bypass: `accel_fifo_config` writes bypass
+   first, then the watermark, the batch rates, the interrupt route, and the
+   mode last. Batching is at the rates the sensors run at, so a change of
+   rate after `accel_fifo_config` leaves the batch rate where it was.
 9. The game rotation vector needs the accelerometer and the gyroscope on at
    the rate of the block or faster. `reset_fusion` starts the block over.
    The block's calibration takes 0.8 s and the orientation settles in 0.7 s
@@ -332,6 +345,23 @@ work or the restore failed.
   on its own clock and the program reads the data-ready flag or the line.
   The interrupt line as `AsyncDeviceReady` needs an edge source on
   `BoardGpio` that embedded-hal-nv does not have.
+
+## Where the traits fall short
+
+- `AccelerometerAsync`, `GyroscopeAsync` and `ThermometerAsync` are not
+  implemented: `async fn` is refused at the embedded tier, and a `@value`
+  driver cannot implement them.
+- `AsyncDeviceReady` has no source, because `BoardGpio` has no `AsyncEdge`.
+- A trait method gets a plain `self`, so the driver keeps no state between
+  calls.
+- `ImuControl` is not implemented: the part has a flag and a rate for each
+  sensor, and the flags are not cleared by a shared read.
+- `Imu.imu_orientation` is a read of the FIFO, since the part delivers the
+  vector there and nowhere else, so it empties the FIFO. The game rotation
+  vector is the block's only output the driver reads; the gravity vector and
+  the gyroscope bias are not.
+- `GyroRange15dps`, `GyroRange31dps` and `GyroRange62dps` are refused: the
+  narrowest range of the part is ±125 dps.
 
 ## Related packages
 
@@ -386,9 +416,9 @@ where it is kept:
   "that must be 1"; so do the functions here.
 - ST's driver powers a sensor down for the software reset and for the
   reboot, and the data sheet asks for it when high-accuracy ODR mode is
-  entered or left; `set_accel_mode` and `set_gyro_mode` do.
+  entered or left; `accel_set_mode` and `set_gyro_mode` do.
 - ST's FIFO examples set the FIFO to bypass before they change its
-  configuration, and write the mode last; so does `fifo_begin`.
+  configuration, and write the mode last; so does `accel_fifo_config`.
 - ST's `sflp2q` reads x, y and z as half-precision numbers, scales a vector
   longer than 1 and takes w from the rest; `quat_at` does, in integers.
 - ST's `lsm6dsv16x_self_test` example gives the rates, ranges, settling and

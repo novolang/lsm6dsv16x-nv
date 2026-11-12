@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
+are path dependencies until they are published.
+
+- `Accelerometer.accel_fifo_config(mode, watermark)` and
+  `accel_fifo_watermark_reached` replace the inherent `fifo_begin`. Behaviour
+  change: the gyroscope is batched when it is running and not on request, and
+  the watermark is 1 to 32 words and refused outside that (`fifo_begin` took
+  up to 255). `AccelFifoStop` is new: the part's FIFO mode, which stops when
+  the FIFO is full. `lsm6dsv16x.fifo_start` is unchanged.
+- `GyroRange125dps` and `GyroRange4000dps` replace the inherent
+  `gyro_set_fs_code`: `gyro_set_range` takes them and `gyro_range` answers
+  them, where 0.1.0 answered `GyroRange250dps` and `GyroRange2000dps` for the
+  codes 0 and 12. `GyroRange15dps`, `31dps` and `62dps` are refused.
+  `gyro_fs_code_write` is gone.
+- `Imu.imu_read_temp` answers the paired sample with the die temperature from
+  one burst of fourteen registers.
+- `Imu.imu_fusion_enable` replaces the inherent `set_fusion`: besides the block
+  it puts the block's words in the FIFO and starts the FIFO in continuous mode
+  when it is in bypass. `Imu.imu_orientation` answers the newest game rotation
+  vector in the FIFO as a Q30 quaternion and empties the FIFO.
+- The inherent `accel_rate_mhz`, `set_accel_rate_mhz`, `accel_mode` and
+  `set_accel_mode` are the trait's `accel_rate_mhz`, `accel_set_rate_mhz`,
+  `accel_mode` and `accel_set_mode`, because an inherent method of the name of
+  a trait method breaks the build. `accel_mode` answers `?AccelMode`.
+  `Lsm6dsv16xMode`, `accel_mode_read` and `accel_mode_write` stay.
+- The waits go through the bus's `delay_us`. The `timer` field of both types is
+  gone; `attach` is unchanged.
+
 ## 0.1.0
 
 The first release: a driver for ST's LSM6DSV16X six-axis IMU on an I2C or an
