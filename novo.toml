@@ -1,6 +1,6 @@
 [package]
 name        = "lsm6dsv16x-nv"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "A driver for ST's LSM6DSV16X six-axis inertial module on an I2C or an SPI bus: the acceleration in milli-g and the rate of turn in milli-degrees per second at the range and rate set, the operating modes (high performance, high-accuracy ODR, low power), the data-ready pins, the FIFO in continuous mode with its tags, the sensor fusion low-power block's game rotation vector as a quaternion from the FIFO, the temperature, the self-tests and WHO_AM_I, as devices-nv's Accelerometer, Gyroscope, Imu, Thermometer and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
